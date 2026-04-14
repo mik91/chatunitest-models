@@ -1,109 +1,127 @@
-CUDA_VISIBLE_DEVICES=1
+import os
 from flask import Flask, request, jsonify
 import torch
-from transformers import LlamaForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, GenerationConfig
 from peft import PeftModel
+
 
 app = Flask(__name__)
 
-device = "cuda"
-model_path = 'models/CodeLlama-7b-Instruct-hf'
+BASE_MODEL = os.getenv("BASE_MODEL", "codellama/CodeLlama-7b-Instruct-hf")
+LORA_MODEL = os.getenv("LORA_MODEL", "zzzghttt/TestGen2-lora")
+MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "2048"))
+DEFAULT_MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "512"))
+DEFAULT_TEMPERATURE = float(os.getenv("TEMPERATURE", "0.6"))
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "1234"))
 
-tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-model = LlamaForCausalLM.from_pretrained(
-    "codellama/CodeLlama-7b-Instruct-hf",
-    load_in_8bit=True,
-    torch_dtype=torch.float16,
-    device_map="auto",
-)
+def build_prompt(data: dict) -> str:
+    if "input" in data:
+        return str(data["input"])
 
-model = PeftModel.from_pretrained(
-    model,
-	"zzzghttt/TestGen2-lora",
-    torch_dtype=torch.float16,
-)
+    mode = data.get("mode", "COMPLETION")
+    project_path = data.get("projectPath", "unknown")
+    assertion_style = data.get("assertionStyle", "JUNIT")
+    static_snapshot = data.get("staticSnapshot", "")
+    runtime_facts = data.get("runtimeFacts", "")
 
-model.eval()
+    return (
+        f"mode={mode}\n"
+        f"projectPath={project_path}\n"
+        f"assertionStyle={assertion_style}\n"
+        f"staticSnapshot:\n{static_snapshot}\n"
+        f"runtimeFacts:\n{runtime_facts}\n\n"
+        "### JUnit Test:\n"
+    )
 
-def tokenize(text):
-    result = tokenizer(
-        text,
+
+def load_model():
+    print(f"Loading tokenizer: {BASE_MODEL}")
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print(f"Loading base model in 8-bit: {BASE_MODEL}")
+    quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL,
+        quantization_config=quantization_config,
+        device_map="auto",
+        torch_dtype=torch.float16,
+    )
+
+    print(f"Loading LoRA adapter: {LORA_MODEL}")
+    model = PeftModel.from_pretrained(model, LORA_MODEL, torch_dtype=torch.float16)
+    model.eval()
+    return tokenizer, model
+
+
+def generate_completion(prompt: str, max_new_tokens: int, temperature: float) -> str:
+    encoded = tokenizer(
+        prompt,
         truncation=True,
-        max_length=2048,
+        max_length=MAX_INPUT_TOKENS,
         padding=False,
         return_tensors="pt",
-        )
-    return result["input_ids"].to(device)
+    )
+    encoded = {k: v.to(model.device) for k, v in encoded.items()}
 
-def generate(
-        text: str,
-        max_tokens: int = 512,
-        temperature: float = 0.6,
-        ):
     generation_config = GenerationConfig(
-            temperature=temperature,
-            do_sample=True,
-            top_p=0.95,
-            repetition_penalty=1.1,
-            eos_token_id=2,
-            pad_token_id=0,
-            )
-    input_ids = tokenize(text)
-    with torch.no_grad():
-        result = model.generate(
-                input_ids=input_ids,
-                generation_config=generation_config,
-                output_scores=True,
-                max_new_tokens=max_tokens,
-                )
-    return result
+        temperature=temperature,
+        do_sample=True,
+        top_p=0.95,
+        repetition_penalty=1.1,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
-@app.route('/generation', methods=['POST'])
+    with torch.no_grad():
+        outputs = model.generate(
+            **encoded,
+            generation_config=generation_config,
+            max_new_tokens=max_new_tokens,
+        )
+
+    prompt_len = encoded["input_ids"].shape[1]
+    generated_ids = outputs[0][prompt_len:]
+    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "baseModel": BASE_MODEL, "loraModel": LORA_MODEL}), 200
+
+
+@app.route("/generation", methods=["POST"])
 def completion():
     data = request.get_json(silent=True) or {}
 
     try:
-        # old protocol：input
-        if 'input' in data:
-            prompt = data['input']
-        else:
-            # new protocol：Runtime2Test object request
-            mode = data.get('mode', 'UNKNOWN')
-            project_path = data.get('projectPath', '')
-            assertion_style = data.get('assertionStyle', 'JUNIT')
-            static_snapshot = data.get('staticSnapshot', '')
-            runtime_facts = data.get('runtimeFacts', '')
+        prompt = build_prompt(data)
+        max_new_tokens = int(data.get("max_tokens", DEFAULT_MAX_NEW_TOKENS))
+        temperature = float(data.get("temperature", DEFAULT_TEMPERATURE))
 
-            prompt = (
-                f"mode={mode}\n"
-                f"projectPath={project_path}\n"
-                f"assertionStyle={assertion_style}\n"
-                f"staticSnapshot:\n{static_snapshot}\n"
-                f"runtimeFacts:\n{runtime_facts}\n"
-            )
+        generated_text = generate_completion(prompt, max_new_tokens=max_new_tokens, temperature=temperature)
 
-        result = generate(prompt)
+        return jsonify(
+            {
+                "success": True,
+                "message": "ok",
+                "result": generated_text,
+                "Result": generated_text,
+                "files": [
+                    {
+                        "relativePath": "se/kth/castor/generated/HybridRockyTest.java",
+                        "content": generated_text,
+                    }
+                ],
+            }
+        ), 200
+    except Exception as exc:
+        return jsonify({"success": False, "message": str(exc), "files": []}), 500
 
-        # 统一返回 Java 客户端期望结构
-        # 这里演示单文件输出，你可按模型结果拆多文件
-        return jsonify({
-            "success": True,
-            "message": "ok",
-            "files": [
-                {
-                    "relativePath": "se/kth/castor/generated/HybridRockyTest.java",
-                    "content": result
-                }
-            ]
-        }), 200
 
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "message": str(e),
-            "files": []
-        }), 200
-
-if __name__ == '__main__':
-    app.run(debug=True, port=1234, threaded=True)
+if __name__ == "__main__":
+    tokenizer, model = load_model()
+    app.run(debug=False, host=HOST, port=PORT, threaded=True)
