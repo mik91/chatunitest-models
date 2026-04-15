@@ -21,6 +21,27 @@ python chatunitest_completion_route.py
 
 3. Then you can make requests by configure the url in ChatUniTest, see example request script in `completion_example.py`.
 
+## Evaluation
+
+Evaluate the fine-tuned model on a held-out split with generation metrics.
+
+```python
+python evaluate_model.py --dataset-name zzzghttt/context2test --split test --base-model codellama/CodeLlama-7b-Instruct-hf --lora-model zzzghttt/TestGen2-lora --max-samples 200
+```
+
+Metrics reported:
+
+- `exact_match`: normalized string exact match against reference test
+- `token_f1`: token-level F1 overlap between prediction and reference
+- `assertion_rate`: ratio of generations containing assertion keywords
+- `valid_java_rate`: ratio of generations with roughly balanced Java braces
+
+Optional prediction dump:
+
+```python
+python evaluate_model.py --output-predictions eval_predictions.jsonl
+```
+
 ## Details
 
 ### Fine-Tuning Method
